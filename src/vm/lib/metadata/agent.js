@@ -20,7 +20,7 @@
  *
  * CDDL HEADER END
  *
- * Copyright (c) 2017, Joyent, Inc. All rights reserved.
+ * Copyright (c) 2018, Joyent, Inc. All rights reserved.
  *
  *
  * # OVERVIEW
@@ -46,17 +46,17 @@
  *
  * # CREATING SOCKETS
  *
- * If the VM is a KVM VM, the qemu process running in the KVM zone will be
- * running with a "ttyb" virtual serial port for the KVM guest. From the host
- * we can connect to connect to /root/tmp/vm.ttyb in the zoneroot which Qemu is
- * listening on for connections. We connect to this as a client but run a
- * metadata server on the resulting connection. Inside the KVM guest the
+ * If the VM is a KVM or bhyve VM, the qemu or bhyve process running in the zone
+ * will be running with a "ttyb" virtual serial port for the KVM guest. From the
+ * host we can connect to connect to /root/tmp/vm.ttyb in the zoneroot on which
+ * Qemu or bhyve is listening for connections. We connect to this as a client
+ * but run a metadata server on the resulting connection. Inside the guest the
  * mdata-client tools connect to the serial device and are then talking to our
  * metadata handler.
  *
- * For all non-KVM VMs we create a unix domain socket in
- * /var/zonecontrol/<zonename> named metadata.sock. We mount the zonecontrol
- * directory into the zone (read-only) via the brand.
+ * For all OS VMs we create a unix domain socket in /var/zonecontrol/<zonename>
+ * named metadata.sock. We mount the zonecontrol directory into the zone
+ * (read-only) via the brand.
  *
  * In non-LX zones, the zonecontrol is mounted such that the socket is at:
  *
@@ -151,6 +151,7 @@ var fs = require('fs');
 var getZoneinfo
     = require('/usr/vm/node_modules/vmload/vmload-zoneinfo').getZoneinfo;
 var guessHandleType = process.binding('tty_wrap').guessHandleType;
+var macaddr = require('/usr/vm/node_modules/macaddr');
 var net = require('net');
 var path = require('path');
 var util = require('util');
@@ -491,10 +492,10 @@ MetadataAgent.prototype.createServersOnExistingZones = function () {
                 return;
             }
 
-            if (zone.brand === 'kvm') {
+            if (zone.brand === 'kvm' || zone.brand === 'bhyve') {
 
                 // For KVM, the zone must be running otherwise Qemu will not
-                // have created a socket.
+                // have created a socket.  A similar situation exists for bhyve.
                 if (zone.zone_state !== 'running') {
                     self.log.debug('skipping zone ' + zone.zonename
                         + ' which has ' + 'non-running zone_state: '
@@ -725,7 +726,8 @@ function handleZoneCreated(zonename) {
                 self.createZoneLog(self.zones[zonename].brand, zonename);
             }
 
-            if (self.zones[zonename].brand === 'kvm') {
+            if (self.zones[zonename].brand === 'kvm'
+                || self.zones[zonename].brand === 'bhyve') {
                 self.startKVMSocketServer(zonename, _dummyCb);
             } else {
                 self.startZoneSocketServer(zonename, _dummyCb);
@@ -755,14 +757,15 @@ MetadataAgent.prototype.start = function start() {
             return;
         }
 
-        // For non-KVM, we only care about create/delete since the socket
-        // only needs to be created once for these zones. For KVM however,
-        // the qemu process recreates the socket on every boot, so we want
-        // to catch 'start' events for KVM to ensure we connect to metadata
-        // as soon as possible.
+        // For non-KVM and non-bhyve, we only care about create/delete since the
+        // socket only needs to be created once for these zones. For KVM and
+        // bhyve however, the qemu or zhyve process recreates the socket on
+        // every boot, so we want to catch 'start' events for KVM or zhyve to
+        // ensure we connect to metadata as soon as possible.
         if (msg.cmd === 'start' && self.zones.hasOwnProperty(msg.zonename)
-            && self.zones[msg.zonename].brand === 'kvm') {
-            // KVM VM started
+            && (self.zones[msg.zonename].brand === 'kvm'
+            || self.zones[msg.zonename].brand === 'bhyve')) {
+            // KVM or bhyve VM started
 
             self.log.debug({
                 delay: (new Date()).getTime() - when.getTime(), // in ms
@@ -1392,27 +1395,79 @@ MetadataAgent.prototype.makeMetadataHandler = function (zone, socket) {
                         // to do the updateZone here so that we have latest
                         // data.
                         for (var r in vmobj.routes) {
+                            var gateway;
+                            var foundNic = null;
                             var route = { linklocal: false, dst: r };
-                            var nicIdx = vmobj.routes[r].match(/nics\[(\d+)\]/);
-                            if (!nicIdx) {
+                            var mac;
+                            var macMatch = vmobj.routes[r]
+                                .match(/^macs\[(.+)\]$/);
+                            var nicMac;
+                            var nicIdx = vmobj.routes[r]
+                                .match(/^nics\[(\d+)\]$/);
+
+                            if (!nicIdx && !macMatch) {
                                 // Non link-local route: we have all the
                                 // information we need already
                                 route.gateway = vmobj.routes[r];
                                 vmRoutes.push(route);
                                 continue;
                             }
-                            nicIdx = Number(nicIdx[1]);
 
-                            // Link-local route: we need the IP of the local nic
-                            if (!vmobj.hasOwnProperty('nics')
-                                || !vmobj.nics[nicIdx]
-                                || !vmobj.nics[nicIdx].hasOwnProperty('ip')
-                                || vmobj.nics[nicIdx].ip === 'dhcp') {
+                            if (macMatch) {
+                                try {
+                                    mac = macaddr.parse(macMatch[1]);
+                                } catch (parseErr) {
+                                    zlog.warn(parseErr, 'failed to parse mac'
+                                        + ' addr');
+                                    continue;
+                                }
 
-                                continue;
+                                if (!vmobj.hasOwnProperty('nics'))
+                                    continue;
+
+                                // Link-local route: we need the IP of the
+                                // local nic with the provided mac address
+                                for (var i = 0; i < vmobj.nics.length; i++) {
+                                    try {
+                                        nicMac = macaddr.parse(vmobj.nics[i]
+                                            .mac);
+                                    } catch (parseErr) {
+                                        zlog.warn(parseErr, 'failed to parse'
+                                            + ' nic mac addr');
+                                        continue;
+                                    }
+                                    if (nicMac.compare(mac) === 0) {
+                                        foundNic = vmobj.nics[i];
+                                        break;
+                                    }
+                                }
+
+                                if (!foundNic || !foundNic.hasOwnProperty('ip')
+                                    || foundNic.ip === 'dhcp') {
+
+                                    continue;
+                                }
+
+                                gateway = foundNic.ip;
+
+                            } else {
+                                nicIdx = Number(nicIdx[1]);
+
+                                // Link-local route: we need the IP of the
+                                // local nic
+                                if (!vmobj.hasOwnProperty('nics')
+                                    || !vmobj.nics[nicIdx]
+                                    || !vmobj.nics[nicIdx].hasOwnProperty('ip')
+                                    || vmobj.nics[nicIdx].ip === 'dhcp') {
+
+                                    continue;
+                                }
+
+                                gateway = vmobj.nics[nicIdx].ip;
                             }
 
-                            route.gateway = vmobj.nics[nicIdx].ip;
+                            assert.string(gateway, 'gateway');
+                            route.gateway = gateway;
                             route.linklocal = true;
                             vmRoutes.push(route);
                         }

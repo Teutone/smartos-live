@@ -21,7 +21,7 @@
  *
  * CDDL HEADER END
  *
- * Copyright (c) 2016, Joyent, Inc. All rights reserved.
+ * Copyright (c) 2018, Joyent, Inc. All rights reserved.
  *
  */
 
@@ -482,13 +482,14 @@ function addFakeFields(m)
         && BRAND_OPTIONS[m.brand].features
         && BRAND_OPTIONS[m.brand].features.type) {
 
-        m.type = BRAND_OPTIONS[m.brand].features.type;
+        // TYPE header is 4 characters, so truncate brand name there too.
+        m.type = BRAND_OPTIONS[m.brand].features.type.substr(0, 4);
     } else {
         // When we don't know 'type', treat as OS VM
         m.type = 'OS';
     }
 
-    if (m.brand !== 'kvm') {
+    if (m.brand !== 'kvm' && m.brand !== 'bhyve') {
         // when we do not normally have 'ram', set as fake property for
         // consistency
         m.ram = m.max_physical_memory;
@@ -1074,12 +1075,14 @@ function main(callback)
             usage('Wrong number of parameters to "sysrq"');
         } else {
             type = parsed.argv.remain[0];
-            if (VM.SYSRQ_TYPES.indexOf(type) === -1) {
+            if (VM.SYSRQ_TYPES['all'].indexOf(type) === -1) {
                 usage('Invalid sysrq type: ' + type);
             } else {
                 VM.sysrq(uuid, type, {}, function (err) {
                     if (err) {
                         callback(err);
+                    } else if (type === 'nmi') {
+                        callback(null, 'Sent NMI to VM ' + uuid);
                     } else {
                         callback(null, 'Sent ' + type + ' sysrq to VM ' + uuid);
                     }
