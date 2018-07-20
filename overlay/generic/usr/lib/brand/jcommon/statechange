@@ -75,6 +75,53 @@ DEFAULT_MTU=1500
 # o jst_mdatapath - The path the metadata socket is expected in the zone
 #
 
+lockdir=/var/run
+function lock_enter {
+	typeset lockname=$1
+	typeset lock=$lockdir/$lockname
+	typeset target=/proc/$$
+
+	if [[ -z $lockname || $lockname == */* ]]; then
+		print -u2 "ERROR: invalid lock '$lockname'"
+		exit 1
+	fi
+	if [[ $lock -ef $target ]]; then
+		print -u2 "ERROR: recursive lock by pid $$"
+		exit 1
+	fi
+
+	while ! ln -s "$target" "$lock" >/dev/null 2>&1; do
+		if [[ -d $lock ]]; then
+			# Process holding the lock still exists
+			sleep 0.1
+			continue
+		fi
+
+		# Lock recovery.  A little race here.  Only encountered if
+		# a lock is abandoned.
+		typeset prev=$(ls -l "$lock" | nawk -F/ '{print $NF}')
+		print -u2 "WARNING: recovering lock $lock (abandoned by $prev)"
+		rm -f "$lock"
+	done
+}
+
+function lock_exit {
+	typeset lockname=$1
+	typeset lock=$lockdir/$lockname
+	typeset target=/proc/$$
+
+	if [[ -z $lockname || $lockname == */* ]]; then
+		print -u2 "ERROR: invalid lock '$lockname'"
+		exit 1
+	fi
+	if ! [[ $lock -ef $target ]]; then
+		print -u2 "ERROR: lock '$lockname' not held by pid $$"
+		exit 1
+	fi
+
+	rm -f "$lock"
+}
+
 get_boolean_nic_property()
 {
 	bool_val=$(eval echo \$_ZONECFG_net_${1}_${2})
@@ -168,6 +215,7 @@ setup_net()
 		allow_unfiltered_promisc=$(get_boolean_nic_property ${nic} \
 		    allow_unfiltered_promisc)
 		allowed_ips=$(eval echo \$_ZONECFG_net_${nic}_allowed_ips)
+		allowed_dhcp_cids=$(eval echo \$_ZONECFG_net_${nic}_allowed_dhcp_cids)
 		vrid=$(eval echo \$_ZONECFG_net_${nic}_vrrp_vrid)
 		vrrp_primary_ip=$(eval \
 		    echo \$_ZONECFG_net_${nic}_vrrp_primary_ip)
@@ -264,6 +312,7 @@ setup_net()
 		# it already exist?
 		#
 		if [[ -n "$isoverlay" ]]; then
+			lock_enter ovlock
 			if ! dladm show-overlay $global_nic 2>/dev/null; then
 				dladm create-overlay $rule -v $num $global_nic
 				if [[ $? -ne 0 ]]; then
@@ -272,9 +321,11 @@ setup_net()
 					     "$global_nic with command " \
 					     "'dladm create-overlay $rule -v " \
 					     "$num $global_nic"
+					lock_exit ovlock
 					exit 1
 				fi
 			fi
+			lock_exit ovlock
 		fi
 
 
@@ -435,12 +486,20 @@ setup_net()
 			unset allowed_ip_map
 			typeset -A allowed_ip_map
 
+			dynamic_methods=""
+			separator=""
 			OLDIFS=$IFS
 			IFS=,
 
 			for zone_ip in $zone_ips; do
 				# For each static IP available, add it to the list.
-				if [[ $zone_ip != "dhcp" ]] && [[ $zone_ip != "addrconf" ]]; then
+				if [[ $zone_ip == "dhcp" ]]; then
+					dynamic_methods+="${separator}dhcpv4"
+					separator=","
+				elif [[ $zone_ip == "addrconf" ]]; then
+					dynamic_methods+="${separator}addrconf"
+					separator=","
+				else
 					clean_ip=`printf "%s" "${zone_ip}" | sed 's|^\([^/]*\)/.*|\1|'`
 					allowed_ip_map[${clean_ip}]=true
 				fi
@@ -471,9 +530,31 @@ setup_net()
 			if [[ -n ${allowed_ip_list} ]] &&
 			    ! dladm set-linkprop -t -z $ZONENAME \
 			    -p "allowed-ips=${allowed_ip_list}" ${nic}; then
-				log_and_exit
+				log_and_exit \
 				    "error setting VNIC allowed-ips $nic $allowed_ip_list"
 			fi
+
+			# Set the dynamic-methods property on the NIC
+			if [[ -n ${dynamic_methods} ]] &&
+			    ! dladm set-linkprop -t -z $ZONENAME \
+			    -p "dynamic-methods=${dynamic_methods}" ${nic}; then
+				log_and_exit \
+				    "error setting VNIC dynamic-methods $nic $dynamic_methods"
+			fi
+		fi
+
+		if [[ "$enable_dhcp" != "true" ]] && [[ -n "$allowed_dhcp_cids" ]] &&
+		    ! dladm set-linkprop -p "allowed-dhcp-cids=${allowed_dhcp_cids}" \
+		    -t -z $ZONENAME $nic; then
+			log_and_exit \
+			    "error setting VNIC allowed-dhcp-cids $nic $allowed_dhcp_cids"
+		fi
+
+		if [[ "$enable_dhcp" != "true" ]] && [[ -z "$allowed_dhcp_cids" ]] &&
+		    [[ "$zone_ips" == *dhcp* || "$zone_ips" == *addrconf* ]] &&
+		    ! dladm set-linkprop -p "allow-all-dhcp-cids=true" \
+		    -t -z $ZONENAME $nic; then
+			log_and_exit "error setting VNIC allow-all-dhcp-cids $nic"
 		fi
 
 		if [[ -n "$jst_ufpromisc" && ${allow_unfiltered_promisc} == "true" ]]; then
@@ -487,7 +568,7 @@ setup_net()
 				# br='block remote'.  Flow names should be < 31
 				# chars in length so that they get unique
 				# kstats.
-			 	# Use the VNIC mac addr. to generate a unique
+				# Use the VNIC mac addr. to generate a unique
 				# name.
 				mac_addr=`dladm show-vnic -z $ZONENAME -p \
 				    -o MACADDRESS $nic | tr ':' '_'`
