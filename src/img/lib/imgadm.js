@@ -20,7 +20,7 @@
  *
  * CDDL HEADER END
  *
- * Copyright (c) 2018, Joyent, Inc. All rights reserved.
+ * Copyright 2020 Joyent, Inc.
  *
  * * *
  * The main imgadm functionality. The CLI is a light wrapper around this tool.
@@ -88,7 +88,15 @@ var DEFAULT_CONFIG = {};
 var SET_REQUIREMENTS_BRAND_BRANDS = ['bhyve', 'lx', 'kvm'];
 
 /* BEGIN JSSTYLED */
-var VMADM_FS_NAME_RE = /^([a-zA-Z][a-zA-Z\._-]*)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(-disk\d+)?$/;
+/**
+ * For vm filesystems, we have three variations to which an image can be
+ * cloned to:
+ *  1. /zones/<uuid>        (smartos, lx and docker)
+ *  2. /zones/<uuid>-diskN  (kvm)
+ *  3. /zones/<uuid>/diskN  (bhyve)
+ */
+var VMADM_FS_NAME_RE = /^([a-zA-Z][a-zA-Z\._-]*)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})([-/]disk\d+)?$/;
+
 var VMADM_IMG_NAME_RE = /^([a-zA-Z][a-zA-Z\._-]*)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /* END JSSTYLED */
@@ -397,11 +405,13 @@ function checkFileChecksum(opts, cb) {
 function IMGADM(options) {
     assert.object(options, 'options');
     assert.object(options.log, 'options.log');
+    assert.optionalString(options.channel, 'options.channel');
 
     this.log = options.log;
     this._manifestFromUuid = null;
     this.sources = null;
     this._db = new Database(options);
+    this.channel = options.channel;
 }
 
 IMGADM.prototype.init = function init(callback) {
@@ -439,6 +449,9 @@ IMGADM.prototype.init = function init(callback) {
         async.forEachSeries(
             sourcesInfo,
             function oneSource(sourceInfo, nextSource) {
+                if (self.channel !== undefined) {
+                    sourceInfo.channel = self.channel;
+                }
                 self._addSource(sourceInfo, true, nextSource);
             },
             function doneSources(err) {
@@ -490,6 +503,7 @@ IMGADM.prototype._addSource = function _addSource(
     assert.object(sourceInfo, 'sourceInfo');
     assert.string(sourceInfo.url, 'sourceInfo.url');
     assert.string(sourceInfo.type, 'sourceInfo.type');
+    assert.optionalString(sourceInfo.channel, 'sourceInfo.channel');
     assert.optionalBool(sourceInfo.insecure, 'sourceInfo.secure');
     assert.bool(skipPingCheck, 'skipPingCheck');
     assert.func(callback, 'callback');
@@ -500,7 +514,8 @@ IMGADM.prototype._addSource = function _addSource(
     for (var i = 0; i < self.sources.length; i++) {
         if (self.sources[i].normUrl === normUrl
             && self.sources[i].type === sourceInfo.type
-            && self.sources[i].insecure === sourceInfo.insecure)
+            && self.sources[i].insecure === sourceInfo.insecure
+            && self.sources[i].channel === sourceInfo.channel)
         {
             return callback(null, false, self.sources[i]);
         }
@@ -530,6 +545,7 @@ IMGADM.prototype.sourceFromInfo = function sourceFromInfo(sourceInfo) {
 
     return mod_sources.createSource(sourceInfo.type, {
         url: sourceInfo.url,
+        channel: sourceInfo.channel,
         insecure: sourceInfo.insecure,
         log: this.log,
         userAgent: this.userAgent,
@@ -1088,6 +1104,7 @@ IMGADM.prototype.sourcesGetImportInfo =
     assert.string(opts.arg, 'opts.arg');
     assert.optionalArrayOfObject(opts.sources, 'opts.sources');
     assert.optionalBool(opts.ensureActive, 'opts.ensureActive');
+    assert.optionalString(opts.channel, 'opts.channel');
     var ensureActive = (opts.ensureActive === undefined
             ? true : opts.ensureActive);
     assert.func(cb, 'cb');
@@ -1595,8 +1612,14 @@ IMGADM.prototype._importImage = function _importImage(opts, cb) {
         }
     };
 
-    logCb('Importing %s from "%s"',
-        source.titleFromImportInfo(opts.importInfo), source.url);
+    if (source.channel !== undefined) {
+        logCb('Importing %s from "%s", channel "%s"',
+            source.titleFromImportInfo(opts.importInfo), source.url,
+            source.channel);
+    } else {
+        logCb('Importing %s from "%s"',
+            source.titleFromImportInfo(opts.importInfo), source.url);
+    }
 
     var context = {};
     vasync.pipeline({arg: context, funcs: [
@@ -3493,6 +3516,16 @@ IMGADM.prototype.createImage = function createImage(options, callback) {
                 log.debug({brand: m.requirements.brand},
                     'set image requirements.brand to source VM brand');
             }
+            if (vmInfo.brand === 'bhyve' && vmInfo.bootrom
+                && !(options.manifest.requirements
+                    && options.manifest.requirements.hasOwnProperty('bootrom')))
+            {
+                if (!m.requirements)
+                    m.requirements = {};
+                m.requirements.bootrom = vmInfo.bootrom;
+                log.debug({bootrom: m.requirements.bootrom},
+                    'set image requirements.bootrom to source VM bootrom');
+            }
             if (incremental) {
                 if (!originInfo) {
                     next(new errors.VmHasNoOriginError(vmUuid));
@@ -3561,6 +3594,37 @@ IMGADM.prototype.createImage = function createImage(options, callback) {
             } else {
                 next();
             }
+        },
+        function removeBhyveQuota(next) {
+            if (vmInfo.brand !== 'bhyve') {
+                next();
+                return;
+            }
+
+            getZfsDataset(vmInfo.zfs_filesystem, ['quota'],
+                function onDataset(err, ds) {
+                    if (err) {
+                        next(err);
+                        return;
+                    }
+
+                    zfs.set(vmInfo.zfs_filesystem, {quota: 'none'},
+                        function quotaSet(e) {
+                            if (e) {
+                                next(e);
+                                return;
+                            }
+
+                            if (ds.quota === '0') {
+                                ds.quota = 'none';
+                            }
+
+                            toCleanup.bhyveQuota = ds.quota;
+                            next();
+                        }
+                    );
+                }
+            );
         },
         function autoprepSnapshotDatasets(next) {
             if (!prepareScript) {
@@ -4049,6 +4113,15 @@ IMGADM.prototype.createImage = function createImage(options, callback) {
 
                         zfsDestroy(snap, self.log, nextSnapshot);
                     },
+                    next);
+            },
+            function cleanupBhyveQuota(next) {
+                if (!toCleanup.bhyveQuota) {
+                    next();
+                    return;
+                }
+
+                zfs.set(vmInfo.zfs_filesystem, {quota: toCleanup.bhyveQuota},
                     next);
             },
             function cleanupAutoprepStartVm(next) {

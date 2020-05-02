@@ -21,7 +21,7 @@
  *
  * CDDL HEADER END
  *
- * Copyright 2018 Joyent, Inc.
+ * Copyright 2019 Joyent, Inc.
  *
  */
 
@@ -34,17 +34,18 @@ var execFile = cp.execFile;
 var fs = require('fs');
 var mod_nic = require('/usr/vm/node_modules/nic');
 var net = require('net');
+var netconfig = require('triton-netconfig');
 var VM = require('/usr/vm/node_modules/VM');
 var onlyif = require('/usr/node/node_modules/onlyif');
 var path = require('path');
 var http = require('http');
 var Qmp = require('/usr/vm/node_modules/qmp').Qmp;
 var qs = require('querystring');
-var SyseventStream = require('/usr/vm/node_modules/sysevent-stream');
 var url = require('url');
 var util = require('util');
 var vasync = require('vasync');
 var zonecfg = require('/usr/vm/node_modules/zonecfg');
+var ZoneEvent = require('/usr/vm/node_modules/zoneevent').ZoneEvent;
 
 /*
  * The DOCKER_RUNTIME_DELAY_RESET parameter is used when restarting a Docker VM
@@ -59,7 +60,6 @@ var zonecfg = require('/usr/vm/node_modules/zonecfg');
 var DOCKER_RUNTIME_DELAY_RESET = 10000;
 
 var REPORTED_STATES = ['running', 'stopped'];
-var UPGRADE_SCRIPT = '/smartdc/vm-upgrade/001_upgrade';
 var VMADMD_PORT = 8080;
 var VMADMD_AUTOBOOT_FILE = '/tmp/.autoboot_vmadmd';
 
@@ -431,23 +431,18 @@ function loadConfig(callback)
     log.debug('loadConfig()');
 
     sysinfo(function (error, s) {
-        var nic, nics;
-
         if (error) {
             callback(error);
         } else {
             SDC.sysinfo = s;
-            // nic tags are in sysinfo but not readily available, we need
-            // admin_ip to know where to listen for stuff like VNC.
-            nics = SDC.sysinfo['Network Interfaces'];
-            for (nic in nics) {
-                if (nics.hasOwnProperty(nic)) {
-                    if (nics[nic]['NIC Names'].indexOf('admin') !== -1) {
-                        SDC.sysinfo.admin_ip = nics[nic].ip4addr;
-                        log.debug('found admin_ip: '
-                            + SDC.sysinfo.admin_ip);
-                    }
-                }
+
+            // We need admin_ip to know where to listen for stuff like VNC.
+            SDC.sysinfo.admin_ip = netconfig.adminIpFromSysinfo(SDC.sysinfo);
+            if (!SDC.sysinfo.admin_ip) {
+                log.warn({sysinfo: SDC.sysinfo},
+                    'Could not find admin IP in sysinfo');
+            } else {
+                log.debug('found admin_ip: ' + SDC.sysinfo.admin_ip);
             }
 
             callback();
@@ -827,8 +822,8 @@ function applyDockerRestartPolicy(vmobj)
 /*
  * This function waits for a VM (vmUuid) to change to a specified state. It is
  * passed to VM.start() so that we avoid creating an additional zoneevent
- * watcher for each, and instead re-use the existing sysevent watcher that we've
- * already got.
+ * watcher for each, and instead re-use the existing zoneevent watcher that
+ * we've already got.
  */
 function stateWaiter(vmUuid, state, opts, callback) {
     assert.uuid(vmUuid, 'vmUuid');
@@ -888,14 +883,14 @@ function updateZoneStatus(ev)
 {
     var load_fields;
     var reprovisioning = false;
-    ev = ev.data;
 
     if (! ev.hasOwnProperty('zonename') || ! ev.hasOwnProperty('oldstate')
-        || ! ev.hasOwnProperty('newstate') || ! ev.hasOwnProperty('when')) {
+        || ! ev.hasOwnProperty('newstate') || ! ev.hasOwnProperty('date')) {
 
         log.debug('skipping unknown event: ' + JSON.stringify(ev, null, 2));
         return;
     }
+
 
     /*
      * With OS-4942 and OS-5011 additional states were added which occur before
@@ -907,8 +902,11 @@ function updateZoneStatus(ev)
         || (ev.oldstate === 'configured' && ev.newstate === 'incomplete')
         || (ev.oldstate === 'incomplete' && ev.newstate === 'installed')) {
         // just log it
-        log.debug({old: ev.oldstate, new: ev.newstate},
-            'ignoring state transitions before first boot');
+        log.debug({
+            old: ev.oldstate,
+            new: ev.newstate,
+            vm: ev.zonename
+        }, 'ignoring state transitions before first boot');
         return;
     }
 
@@ -946,14 +944,14 @@ function updateZoneStatus(ev)
     // if we've never seen this VM before, we always load once.
     if (!seen_vms.hasOwnProperty(ev.zonename)) {
         log.debug(ev.zonename + ' is a VM we haven\'t seen before and went '
-            + 'from ' + ev.oldstate + ' to ' + ev.newstate + ' at ' + ev.when);
+            + 'from ' + ev.oldstate + ' to ' + ev.newstate + ' at ' + ev.date);
         seen_vms[ev.zonename] = {};
         // We'll continue on to load this VM below with VM.load()
     } else if (!seen_vms[ev.zonename].hasOwnProperty('uuid')) {
         // We just saw this machine and haven't finished loading it the first
         // time.
         log.debug('Already loading VM ' + ev.zonename + ' ignoring transition'
-            + ' from ' + ev.oldstate + ' to ' + ev.newstate + ' at ' + ev.when);
+            + ' from ' + ev.oldstate + ' to ' + ev.newstate + ' at ' + ev.date);
         return;
     } else if (PROV_WAIT[seen_vms[ev.zonename].uuid]) {
         // We're already waiting for this machine to provision, other
@@ -989,7 +987,7 @@ function updateZoneStatus(ev)
             'zonepath'
         ]}, function (err, vmobj) {
             log.info(ev.zonename + ' (docker) went from ' + ev.oldstate + ' to '
-                + ev.newstate + ' at ' + ev.when);
+                + ev.newstate + ' at ' + ev.date);
 
             /*
              * If we stop while autoboot is set, the user was intending for it
@@ -1029,7 +1027,7 @@ function updateZoneStatus(ev)
         if (!reprovisioning) {
             log.trace('ignoring transition for ' + ev.zonename + ' ('
                 + seen_vms[ev.zonename].brand + ') from ' + ev.oldstate + ' to '
-                + ev.newstate + ' at ' + ev.when);
+                + ev.newstate + ' at ' + ev.date);
             return;
         }
     }
@@ -1158,18 +1156,14 @@ function updateZoneStatus(ev)
     });
 }
 
-function startZoneWatcher(callback)
+function startZoneEvent(callback)
 {
-
-    var se = new SyseventStream({
-        class: 'status',
-        logger: log,
-        channel: 'com.sun:zones:status'
+    var ze = new ZoneEvent({
+        name: 'vmadmd ZoneEvent',
+        log: log
     });
-    se.on('readable', function () {
-        var ev;
-        while ((ev = se.read()) !== null)
-            callback(ev);
+    ze.on('event', function (ev) {
+        callback(ev);
     });
 }
 
@@ -1461,6 +1455,7 @@ function infoVM(uuid, types, callback)
         'query-pci',
         'query-kvm'
     ];
+    var loadCbs = {};
 
     log.debug('LOADING: ' + uuid);
 
@@ -1472,18 +1467,15 @@ function infoVM(uuid, types, callback)
     ];
 
     VM.load(uuid, {fields: load_fields}, function (err, vmobj) {
-        var q;
-        var socket;
-        var type;
-
         if (err) {
-            callback('Unable to load vm: ' + JSON.stringify(err));
+            callback(new Error('Unable to load vm: ' + JSON.stringify(err)));
             return;
         }
 
-        if (vmobj.brand !== 'kvm') {
-            callback(new Error('vmadmd only handles "info" for kvm ('
-                + 'your brand is: ' + vmobj.brand + ')'));
+        if (!loadCbs.hasOwnProperty(vmobj.brand)) {
+            callback(new Error('vmadmd only handles "info" for: "'
+                + vmobj.keys.join('", "') + '".  Your brand is: "'
+                + vmobj.brand + '".'));
             return;
         }
 
@@ -1493,19 +1485,28 @@ function infoVM(uuid, types, callback)
             return;
         }
 
-        q = new Qmp(log);
-
         if (!types) {
             types = ['all'];
         }
 
-        for (type in types) {
-            type = types[type];
-            if (VM.INFO_TYPES.indexOf(type) === -1) {
-                callback(new Error('unknown info type: ' + type));
-                return;
-            }
+        try {
+            VM.checkInfoTypes(vmobj, types);
+        } catch (_err) {
+            callback(_err);
+            return;
         }
+
+        loadCbs[vmobj.brand](vmobj);
+    });
+
+    loadCbs.kvm = function loadKvmCb(vmobj) {
+        assert.object(vmobj);
+        assert.uuid(vmobj.uuid);
+
+        var q;
+        var socket;
+
+        q = new Qmp(log);
 
         socket = vmobj.zonepath + '/root/tmp/vm.qmp';
 
@@ -1544,19 +1545,7 @@ function infoVM(uuid, types, callback)
                     if ((types.indexOf('all') !== -1)
                         || (types.indexOf('vnc') !== -1)) {
 
-                        res.vnc = {};
-                        if (VNC.hasOwnProperty(vmobj.uuid)) {
-                            res.vnc.host = VNC[vmobj.uuid].host;
-                            res.vnc.port = VNC[vmobj.uuid].port;
-                            if (VNC[vmobj.uuid].hasOwnProperty('display')) {
-                                res.vnc.display = VNC[vmobj.uuid].display;
-                            }
-                            if (VNC[vmobj.uuid].hasOwnProperty('password')
-                                && VNC[vmobj.uuid].password.length > 0) {
-
-                                res.vnc.password = VNC[vmobj.uuid].password;
-                            }
-                        }
+                        infoVNC();
                     }
                     if ((types.indexOf('all') !== -1)
                         || (types.indexOf('spice') !== -1)) {
@@ -1582,7 +1571,33 @@ function infoVM(uuid, types, callback)
                 }
             });
         });
-    });
+    };
+
+    loadCbs.bhyve = function loadBhyveCb(vmobj) {
+        assert.object(vmobj);
+        assert.uuid(vmobj.uuid);
+
+        if (types.indexOf('all') !== -1 || types.indexOf('vnc') !== -1) {
+            infoVNC();
+        }
+        callback(null, res);
+    };
+
+    function infoVNC() {
+        res.vnc = {};
+        if (VNC.hasOwnProperty(uuid)) {
+            res.vnc.host = VNC[uuid].host;
+            res.vnc.port = VNC[uuid].port;
+            if (VNC[uuid].hasOwnProperty('display')) {
+                res.vnc.display = VNC[uuid].display;
+            }
+            if (VNC[uuid].hasOwnProperty('password')
+                && VNC[uuid].password.length > 0) {
+
+                res.vnc.password = VNC[uuid].password;
+            }
+        }
+    }
 }
 
 function resetVM(uuid, callback)
@@ -2091,6 +2106,7 @@ function upgradeVM(vmobj, fields, callback)
 
                 image_uuid = origin.split('@')[0].split('/').pop();
                 log.info('setting new image_uuid: ' + image_uuid);
+
                 cmd = [
                     'add attr',
                     'set name=dataset-uuid',
@@ -2100,7 +2116,6 @@ function upgradeVM(vmobj, fields, callback)
                 ].join('; ');
 
                 zonecfg(vmobj.uuid, [cmd], {log: log},
-
                     function (add_err, add_fds) {
                         if (add_err) {
                             log.error(add_err);
@@ -2328,32 +2343,10 @@ function upgradeVM(vmobj, fields, callback)
                 cb();
             });
         }, function (cb) {
-            fs.exists(UPGRADE_SCRIPT, function (exists) {
-                if (exists) {
-                    execFile(UPGRADE_SCRIPT, [vmobj.uuid],
-                        function (err, stdout, stderr) {
-                            log.debug({err: err, stdout: stdout,
-                                stderr: stderr}, 'upgrade output');
-                            if (err) {
-                                log.error(err);
-                                cb(err);
-                                return;
-                            }
-                            log.info('successfully ran 001_upgrade');
-                            cb();
-                        }
-                    );
-                } else {
-                    log.warn('No ' + UPGRADE_SCRIPT + ', skipping');
-                    cb();
-                }
-            });
-        }, function (cb) {
             // zonecfg update vm-version = 1
             var cmd;
 
             log.debug('setting vm-version = 1');
-
             cmd = [
                 'add attr',
                 'set name=vm-version',
@@ -2397,7 +2390,7 @@ function main()
 {
     // XXX TODO: load fs-ext so we can flock a pid file to be exclusive
 
-    startZoneWatcher(updateZoneStatus);
+    startZoneEvent(updateZoneStatus);
     startHTTPHandler();
     startTraceLoop();
     startSeenCleaner();
@@ -2592,6 +2585,14 @@ function main()
                                     upgrade_payload.update_nics.push(
                                         update_nic);
                                 }
+                            }
+
+                            if (upgrade_payload.update_nics.length === 0) {
+                                log.debug({
+                                    vm_uuid: vmobj.uuid
+                                }, 'no nics to update, skipping VM.update()');
+                                finishUpgrade(vmobj);
+                                return;
                             }
 
                             log.info('updating ' + vmobj.uuid + ' with: '

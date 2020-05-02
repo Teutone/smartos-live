@@ -20,7 +20,7 @@
  *
  * CDDL HEADER END
  *
- * Copyright (c) 2013, Joyent, Inc. All rights reserved.
+ * Copyright 2020 Joyent, Inc.
  *
  * * *
  *
@@ -54,14 +54,23 @@ var WRKDIR = '/var/tmp/img-test-import';
 var CACHEDIR = '/var/tmp/img-test-cache';
 
 /*
- * Pick an image that (a) exists on datasets.jo (they *do* occassionally get
- * deprecated) and (b) is relatively small and (c) is unlikely to collide with
- * current usage.
- *
- * Also don't collide with TEST_IMAGE_UUID used in "dsapi.test.js".
+ * Pick an image that (a) exists on images.joyent.com (they *do* occasionally
+ * get deprecated) and (b) is relatively small and (c) is unlikely to collide
+ * with current usage.
  */
 // minimal-32@15.2.0
 var TEST_IMAGE_UUID = '0764d78e-3472-11e5-8949-4f31abea4e05';
+
+/*
+ * An image that only exists on the experimental channel of updates.joyent.com.
+ * Similar to the note above, hopefully this image will always be here and will
+ * not be present on images.joyent.com, since tests rely on this fact.
+ * During setup, we import the origin image for this experimental image.
+ */
+var TEST_EXPERIMENTAL_SOURCE =
+    'https://updates.joyent.com?channel=experimental';
+var TEST_EXPERIMENTAL_ORIGIN = 'fd2cc906-8938-11e3-beab-4359c665ac99';
+var TEST_EXPERIMENTAL_UUID = 'b323e23f-e762-4677-a2c8-b56f3bd5ef48';
 
 var CACHEFILE = format('%s/%s.file', CACHEDIR, TEST_IMAGE_UUID);
 
@@ -87,9 +96,16 @@ test('setup: ensure images.joyent.com source', function (t) {
 });
 
 test('setup: get test image in local SDC IMGAPI (if available)', function (t) {
-    var cmd = 'sdc-imgadm import ' + TEST_IMAGE_UUID +
-        ' -S https://images.joyent.com || true';
+    var cmd = 'sdc-imgadm import ' + TEST_IMAGE_UUID
+        + ' -S https://images.joyent.com || true';
     exec(cmd, function (err, o, e) {
+        t.ifError(err);
+        t.end();
+    });
+});
+
+test('setup: get origin for experimental image', function (t) {
+    exec('imgadm import ' + TEST_EXPERIMENTAL_ORIGIN, function (err, o, e) {
         t.ifError(err);
         t.end();
     });
@@ -99,7 +115,7 @@ test('setup: CACHEDIR (' + CACHEDIR + ')', function (t) {
     mkdirp(CACHEDIR, function (err) {
         t.ifError(err);
         t.end();
-    })
+    });
 });
 
 test('setup: cache test image manifest', function (t) {
@@ -119,7 +135,6 @@ test('setup: cache test image manifest', function (t) {
 });
 
 test('setup: cache test image file', function (t) {
-    var pth = format('%s/%s.file', CACHEDIR, TEST_IMAGE_UUID);
     fs.exists(CACHEFILE, function (exists) {
         if (!exists) {
             var cmd = format(
@@ -212,7 +227,8 @@ test('concurrent: imgadm install ... ' + TEST_IMAGE_UUID, function (t) {
         function installTheImage(who, next) {
             // TODO: capture this log and assert that there was some waiting
             //       on locks?
-            var cmd = format('imgadm install -m %s/%s.imgmanifest -f %s/%s.file',
+            var cmd = format(
+                'imgadm install -m %s/%s.imgmanifest -f %s/%s.file',
                 CACHEDIR, TEST_IMAGE_UUID, CACHEDIR, TEST_IMAGE_UUID);
             t.exec(cmd, function () {
                 t.exec('imgadm get ' + TEST_IMAGE_UUID, function () {
@@ -226,7 +242,7 @@ test('concurrent: imgadm install ... ' + TEST_IMAGE_UUID, function (t) {
                 t.end();
             });
         }
-    )
+    );
 });
 
 
@@ -257,7 +273,7 @@ test('concurrent: imgadm import ' + TEST_IMAGE_UUID, function (t) {
                 t.end();
             });
         }
-    )
+    );
 });
 
 
@@ -284,7 +300,8 @@ test('pre-downloaded file; imgadm import ' + TEST_IMAGE_UUID, function (t) {
         t.exec('imgadm -v import ' + TEST_IMAGE_UUID, function (err, o, e) {
             // Stderr has the imgadm log output. Look for the tell-tale sign
             // that the pre-downloaded image file was used.
-            var marker = /"msg":"using pre-downloaded image file/;
+            // The '.' instead of '"' is to make jsstyle happy.
+            var marker = /.msg.:.using pre-downloaded image file/;
             t.ok(marker.test(e), 'pre-downloaded image file was used');
             t.notOk(fs.existsSync(downFile));
             t.exec('imgadm get ' + TEST_IMAGE_UUID, function () {
@@ -304,14 +321,17 @@ test('setup6: remove image ' + TEST_IMAGE_UUID, function (t) {
 });
 
 // This is #2 pre-downloaded-image-file test. See above.
-test('pre-downloaded file (bad size); imgadm import ' + TEST_IMAGE_UUID, function (t) {
+test('pre-downloaded file (bad size); imgadm import ' + TEST_IMAGE_UUID,
+    function (t) {
+
     var wrongSizeFile = '/usr/img/package.json';
     var downFile = common.downloadFileFromUuid(TEST_IMAGE_UUID);
     t.exec(format('cp %s %s', wrongSizeFile, downFile), function () {
         t.exec('imgadm -v import ' + TEST_IMAGE_UUID, function (err, o, e) {
             // Stderr has the imgadm log output. Look for the tell-tale sign
             // that the pre-downloaded image file was discarded.
-            var marker = /"msg":"unexpected size for pre-downloaded image/;
+            // The '.' instead of '"' is to make jsstyle happy.
+            var marker = /.msg.:.unexpected size for pre-downloaded image/;
             t.ok(marker.test(e), 'pre-downloaded image file was discarded');
             t.notOk(fs.existsSync(downFile));
             t.exec('imgadm get ' + TEST_IMAGE_UUID, function () {
@@ -331,17 +351,21 @@ test('setup7: remove image ' + TEST_IMAGE_UUID, function (t) {
 });
 
 // This is #3 pre-downloaded-image-file test. See above.
-test('pre-downloaded file (bad checksum); imgadm import ' + TEST_IMAGE_UUID, function (t) {
+test('pre-downloaded file (bad checksum); imgadm import ' + TEST_IMAGE_UUID,
+    function (t) {
+
     // Copy in our cached file and change it (keeping same size):
     var downFile = common.downloadFileFromUuid(TEST_IMAGE_UUID);
     t.exec(format('cp %s %s', CACHEFILE, downFile), function () {
-    t.exec('echo -ne BLARG | dd conv=notrunc bs=1 count=5 of=' + downFile, function () {
+    t.exec('echo -ne BLARG | dd conv=notrunc bs=1 count=5 of=' + downFile,
+        function () {
 
         // Then test import with that bogus file there.
         t.exec('imgadm -v import ' + TEST_IMAGE_UUID, function (err, o, e) {
             // Stderr has the imgadm log output. Look for the tell-tale sign
             // that the pre-downloaded image file was discarded.
-            var marker = /"msg":"unexpected checksum for pre-downloaded image/;
+            // The '.' instead of '"' is to make jsstyle happy.
+            var marker = /.msg.:.unexpected checksum for pre-downloaded image/;
             t.ok(marker.test(e), 'pre-downloaded image file was discarded');
             t.notOk(fs.existsSync(downFile));
             t.exec('imgadm get ' + TEST_IMAGE_UUID, function () {
@@ -353,7 +377,115 @@ test('pre-downloaded file (bad checksum); imgadm import ' + TEST_IMAGE_UUID, fun
     }); // cp
 });
 
+// Force removal of any dangling experimental image and sources which might
+// prevent these tests from reporting correct results.
+test('setup8: rm experimental image ' + TEST_EXPERIMENTAL_UUID, function (t) {
+    var cmd = format(
+        'imgadm delete %s ;'
+            + 'imgadm sources -d https://updates.joyent.com ;'
+            + 'imgadm sources -d '
+            + TEST_EXPERIMENTAL_SOURCE,
+        TEST_EXPERIMENTAL_UUID);
+    t.exec(cmd, function () {
+        // it's ok if any of these fail, since those may not have been
+        // configured in the first place.
+        t.end();
+    });
+});
 
+// With no configured experimental sources, this should fail, which will
+// also help determine whether the image has perhaps been added to
+// images.joyent.com, in which case, maintainers should select a different
+// TEST_EXPERIMENTAL_UUID (and TEST_EXPERIMENTAL_ORIGIN if necessary)
+test('experimental image import fails', function (t) {
+    var cmd = 'imgadm import ' + TEST_EXPERIMENTAL_UUID;
+    exec(cmd, function (err, o, e) {
+        t.ok(/ActiveImageNotFound/.test(e),
+            'ActiveImageNotFound error code on stderr');
+        t.end();
+    });
+});
+
+test('setup9: add updates.joyent.com source', function (t) {
+    var cmd = 'imgadm sources -a https://updates.joyent.com';
+    exec(cmd, function () {
+        t.end();
+    });
+});
+
+// With a -C argument, this should succeed, assuming our test experimental
+// image does still exist on that channel.
+test('experimental image import with -C arg', function (t) {
+    var cmd = 'imgadm import -C experimental ' + TEST_EXPERIMENTAL_UUID;
+    exec(cmd, function (err, stdout, stderr) {
+        t.ifError(err);
+        exec('imgadm get ' + TEST_EXPERIMENTAL_UUID, function (err2, o, e) {
+            t.ifError(err2);
+            t.end();
+        });
+    });
+});
+
+test('setup10: delete experimental image', function (t) {
+    var cmd = format('imgadm delete %s', TEST_EXPERIMENTAL_UUID);
+    exec(cmd, function () {
+        t.end();
+    });
+});
+
+// With a -S argument, this should succeed
+test('experimental image import with -S channel url', function (t) {
+    var cmd = ('imgadm import '
+            + '-S ' + TEST_EXPERIMENTAL_SOURCE + ' '
+            + TEST_EXPERIMENTAL_UUID);
+    exec(cmd, function (err, stdout, stderr) {
+        t.ifError(err);
+        exec('imgadm get ' + TEST_EXPERIMENTAL_UUID, function (err2, o, e) {
+            t.ifError(err2);
+            t.end();
+        });
+    });
+});
+
+// delete our experimental image and our updates.joyent.com url, then add
+// that source, this time with a channel.
+test('setup11: delete experimental image', function (t) {
+    var cmd = format(
+        'imgadm delete %s ; '
+            + 'imgadm sources -d https://updates.joyent.com ; '
+            + 'imgadm sources -a '
+            + TEST_EXPERIMENTAL_SOURCE + ' ',
+        TEST_EXPERIMENTAL_UUID);
+    exec(cmd, function (err, o, e) {
+        t.ifError(err);
+        t.end();
+    });
+});
+
+// With a configured experimental channel, this should succeed
+test('experimental image import configured channel', function (t) {
+    var cmd = 'imgadm import ' + TEST_EXPERIMENTAL_UUID;
+    exec(cmd, function (err, stdout, stderr) {
+        t.ifError(err);
+        exec('imgadm get ' + TEST_EXPERIMENTAL_UUID, function (err2, o, e) {
+            t.ifError(err2);
+            t.end();
+        });
+    });
+});
+
+test('experimental channel sources show up in list output', function (t) {
+    exec('imgadm list -o uuid,source | grep ' + TEST_EXPERIMENTAL_UUID,
+    function (err, o, e) {
+        t.ifError(err);
+        var firstLine = o.split(/\n/g)[0];
+        var results = firstLine.split('  ');
+        t.equal(results.length, 2);
+        t.equal(results[0], TEST_EXPERIMENTAL_UUID);
+        t.equal(results[1], TEST_EXPERIMENTAL_SOURCE);
+        t.end();
+    });
+});
 
 // Need a test IMGAPI for the following:
 // TODO: test case importing from IMGAPI *with an origin*

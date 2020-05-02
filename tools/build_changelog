@@ -12,7 +12,7 @@
 #
 
 #
-# Copyright (c) 2013, Joyent, Inc. All rights reserved.
+# Copyright 2020 Joyent, Inc.
 # Copyright (c) 2014 Elysium Digital, L.L.C.
 #
 
@@ -59,7 +59,21 @@ function build_section
 	directory=$1
 	lastbranch=$2
 	cd $directory || fail "Unable to cd to $directory"
-	description=${3:-$(basename $PWD)}
+
+	#
+	# The names of the various ./projects directories are used as the
+	# description headers for each section of the changelog. For the top level
+	# repository, smartos-live.git itself, we use 'platform' to maintain
+	# consistency with previous changelogs, which used the basename of
+	# release build workspace. That value was always 'platform' in the past.
+	# smartos-changelog.git:/smartos.html currently depends on the exact names
+	# of these headers.
+	#
+	if [[ "$directory" = "." ]]; then
+		description="platform"
+	else
+		description=${3:-$(basename $PWD)}
+	fi
 	echo $description ; echo "--------" ; echo
 	get_log ${lastbranch} || fail "failed to get log for $directory"
 }
@@ -85,10 +99,3 @@ for git_dir in $(/usr/bin/find projects -maxdepth 3 -type d -name .git || \
 	(build_section ${git_dir}/.. ${lastbranch} >> output/changelog.txt) || \
 	    fail "failed to build_section for projects/${project}"
 done
-
-if [[ -d overlay/smartos ]] && \
-    grep -q ${PWD}/overlay/smartos overlay/order; then
-	(build_section overlay/smartos ${lastbranch} smartos-overlay >> \
-	    output/changelog.txt) || \
-	    fail "failed to build_section for overlay/smartos"
-fi

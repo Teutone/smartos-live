@@ -5,6 +5,28 @@ Known issues:
 - Docker image imports are experimental. Docker image import also only supports
   Docker Registry v2.
 
+## 3.9.4
+
+- OS-7601 want channel support for imgadm.
+  This change adds channel support for 'imgapi' sources.
+
+  The 'import' subcommand takes a '-C <channel>' argument, allowing users
+  to override the channel for all configured sources.
+
+  Otherwise, channels can be specified as a component of any URL parameter, e.g.
+
+      imgadm sources -a 'https://updates.joyent.com?channel=experimental'
+      or
+      imgadm import -S 'https://updates.joyent.com?channel=experimental' <uuid>
+
+## 3.9.3
+
+- joyent/smartos-live#771 imgadm vacuum will try to reap images used by bhyve vms
+
+## 3.9.2
+
+- TRITON-622 'stdin.write' in promptYesNo func in common.js breaks on node v10
+
 ## 3.9.1
 
 - OS-5979 ensure imgadm uses the provided req_id
